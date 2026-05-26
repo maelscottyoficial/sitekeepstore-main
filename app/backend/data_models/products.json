@@ -1,0 +1,68 @@
+{
+    "title": "products",
+    "type": "object",
+    "properties": {
+        "id": {
+            "type": "integer",
+            "description": "Primary key, auto-increment"
+        },
+        "name": {
+            "type": "string",
+            "description": "Product name"
+        },
+        "original_price": {
+            "type": "number",
+            "description": "Original price before discount"
+        },
+        "current_price": {
+            "type": "number",
+            "description": "Current selling price"
+        },
+        "discount": {
+            "type": "integer",
+            "description": "Discount percentage"
+        },
+        "installments": {
+            "type": "integer",
+            "description": "Number of installments"
+        },
+        "installment_price": {
+            "type": "number",
+            "description": "Price per installment"
+        },
+        "category": {
+            "type": "string",
+            "description": "Product category"
+        },
+        "gradient": {
+            "type": "string",
+            "description": "CSS gradient class for card background"
+        },
+        "image_url": {
+            "type": "string",
+            "description": "Product image URL"
+        },
+        "description": {
+            "type": "string",
+            "description": "Product description"
+        },
+        "is_promotional": {
+            "type": "boolean",
+            "description": "Whether product is in promotions section"
+        },
+        "is_bestseller": {
+            "type": "boolean",
+            "description": "Whether product is a best seller"
+        },
+        "active": {
+            "type": "boolean",
+            "description": "Whether product is active/visible"
+        }
+    },
+    "required": [
+        "id",
+        "name",
+        "current_price",
+        "category"
+    ]
+}
