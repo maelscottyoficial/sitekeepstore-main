@@ -5,3 +5,8 @@ build/
 __pycache__
 dist
 vite.config.ts.timestamp-*
+
+.env
+app/.env
+app/backend/.env
+app/frontend/.env
