@@ -24,6 +24,19 @@ async def get_bearer_token(
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication credentials were not provided")
 
 
+async def get_bearer_token_optional(
+    request: Request, credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme)
+) -> Optional[str]:
+    """Extract bearer token from Authorization header, returning None if absent."""
+    if credentials and credentials.scheme.lower() == "bearer":
+        return credentials.credentials
+    # Also check HttpOnly cookie set by the OAuth flow
+    cookie_token = request.cookies.get("access_token")
+    if cookie_token:
+        return cookie_token
+    return None
+
+
 async def get_current_user(token: str = Depends(get_bearer_token)) -> UserResponse:
     """Dependency to get current authenticated user via JWT token."""
     try:
@@ -46,6 +59,42 @@ async def get_current_user(token: str = Depends(get_bearer_token)) -> UserRespon
             # Log user hash instead of actual user ID to avoid exposing sensitive information
             user_hash = hashlib.sha256(str(user_id).encode()).hexdigest()[:8] if user_id else "unknown"
             logger.debug("Failed to parse last_login for user hash: %s", user_hash)
+
+    return UserResponse(
+        id=user_id,
+        email=payload.get("email", ""),
+        name=payload.get("name"),
+        role=payload.get("role", "user"),
+        last_login=last_login,
+    )
+
+
+async def get_current_user_optional(
+    token: Optional[str] = Depends(get_bearer_token_optional),
+) -> Optional[UserResponse]:
+    """Dependency that returns the current user if authenticated, or None if not.
+
+    Use this on endpoints that behave differently for authenticated vs anonymous
+    users but do not *require* authentication.
+    """
+    if not token:
+        return None
+    try:
+        payload = decode_access_token(token)
+    except AccessTokenError:
+        return None
+
+    user_id = payload.get("sub")
+    if not user_id:
+        return None
+
+    last_login_raw = payload.get("last_login")
+    last_login = None
+    if isinstance(last_login_raw, str):
+        try:
+            last_login = datetime.fromisoformat(last_login_raw)
+        except ValueError:
+            pass
 
     return UserResponse(
         id=user_id,
