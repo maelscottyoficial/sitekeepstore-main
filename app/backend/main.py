@@ -5,6 +5,14 @@ import pkgutil
 import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load .env before anything else so all modules see the env vars
+_env_path = Path(__file__).parent / ".env"
+if _env_path.exists():
+    load_dotenv(_env_path, override=False)
 
 from core.config import settings
 from fastapi import FastAPI, HTTPException, Request, status
@@ -196,32 +204,10 @@ def health_check():
 
 
 def run_in_debug_mode(app: FastAPI):
-    """Run the FastAPI app in debug mode with proper asyncio handling.
-
-    This function handles the special case of running in a debugger (PyCharm, VS Code, etc.)
-    where asyncio is patched, causing conflicts with uvicorn's asyncio_run.
-
-    It loads environment variables from ../.env and uses asyncio.run() directly
-    to avoid uvicorn's asyncio_run conflicts.
-
-    Args:
-        app: The FastAPI application instance
-    """
+    """Run the FastAPI app in debug mode with proper asyncio handling."""
     import asyncio
-    from pathlib import Path
-
     import uvicorn
-    from dotenv import load_dotenv
 
-    # Load environment variables from ../.env in debug mode
-    # If `LOCAL_DEBUG=true` is set, then MetaGPT's `ProjectBuilder.build()` will generate the `.env` file
-    env_path = Path(__file__).parent.parent / ".env"
-    if env_path.exists():
-        load_dotenv(env_path, override=True)
-        logger = logging.getLogger(__name__)
-        logger.info(f"Loaded environment variables from {env_path}")
-
-    # In debug mode, use asyncio.run() directly to avoid uvicorn's asyncio_run conflicts
     config = uvicorn.Config(
         app,
         host="0.0.0.0",
@@ -234,17 +220,14 @@ def run_in_debug_mode(app: FastAPI):
 
 if __name__ == "__main__":
     import sys
-
     import uvicorn
 
     # Detect if running in debugger (PyCharm, VS Code, etc.)
-    # Debuggers patch asyncio which conflicts with uvicorn's asyncio_run
     is_debugging = "pydevd" in sys.modules or (hasattr(sys, "gettrace") and sys.gettrace() is not None)
 
     if is_debugging:
         run_in_debug_mode(app)
     else:
-        # Enable reload in normal mode
         uvicorn.run(
             app,
             host="0.0.0.0",
