@@ -3,3 +3,9 @@ git status
 git add .
 git commit -m "minha atualização"
 git push origin main
+
+_-----------
+
+Atualiza do Github para PC
+
+git pull origin main
