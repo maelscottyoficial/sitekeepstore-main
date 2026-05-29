@@ -1,5 +1,5 @@
-PS C:\Users\omais> cd "C:\Users\omais\Downloads\Nova pasta (4)\sitekeepstore-main"
-PS C:\Users\omais\Downloads\Nova pasta (4)\sitekeepstore-main> git status
->> git add .
->> git commit -m "minha atualização"
->> git push origin main
+cd "C:\Users\omais\Downloads\Nova pasta (4)\sitekeepstore-main"
+git status
+git add .
+git commit -m "minha atualização"
+git push origin main
