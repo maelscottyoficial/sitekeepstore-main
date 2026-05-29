@@ -1,251 +1,315 @@
-import base64
-import hashlib
+"""
+Authentication Router
+---------------------
+Exposes all auth-related HTTP endpoints:
+
+  GET  /api/v1/auth/login          -> Redirects to Google OAuth consent screen
+  GET  /api/v1/auth/callback       -> Handles the OAuth callback from Google
+  POST /api/v1/auth/login          -> Email/password login (local accounts)
+  GET  /api/v1/auth/me             -> Returns the currently authenticated user
+  POST /api/v1/auth/logout         -> Clears the session cookie
+
+The helpers that generate URLs, validate ID tokens and create JWTs live in
+`core/auth.py`.  Business logic (DB access, token issuance) lives in
+`services/auth.py`.
+"""
+
 import logging
-import secrets
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Optional
 
 import httpx
+from core.auth import (
+    IDTokenValidationError,
+    build_authorization_url,
+    build_logout_url,
+    generate_code_challenge,
+    generate_code_verifier,
+    generate_nonce,
+    generate_state,
+    validate_id_token,
+)
 from core.config import settings
-from jose import JWTError, jwt
-from jose.exceptions import ExpiredSignatureError, JWSSignatureError, JWTClaimsError
+from dependencies.auth import get_current_user, get_current_user_optional
+from dependencies.database import get_db
+from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse, RedirectResponse
+from pydantic import BaseModel, EmailStr
+from services.auth import AuthService
+from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 
+router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
-def generate_state() -> str:
-    """Generate a secure state parameter for OIDC."""
-    return secrets.token_urlsafe(32)
+# ---------------------------------------------------------------------------
+# Schemas
+# ---------------------------------------------------------------------------
 
-
-def generate_nonce() -> str:
-    """Generate a secure nonce parameter for OIDC."""
-    return secrets.token_urlsafe(32)
-
-
-def generate_code_verifier() -> str:
-    """Generate PKCE code verifier."""
-    return secrets.token_urlsafe(96)  # 128 bytes base64url encoded
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
 
 
-def generate_code_challenge(code_verifier: str) -> str:
-    """Generate PKCE code challenge from verifier using SHA256."""
-    digest = hashlib.sha256(code_verifier.encode("utf-8")).digest()
-    return base64.urlsafe_b64encode(digest).decode("utf-8").rstrip("=")
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_at: str
 
 
-async def get_jwks() -> Dict[str, Any]:
-    """Get JWKS (JSON Web Key Set) from OIDC provider."""
-    jwks_url = "https://www.googleapis.com/oauth2/v3/certs"
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            logger.info(f"Fetching JWKS from: {jwks_url}")
-            response = await client.get(jwks_url)
-            response.raise_for_status()
-            jwks_data = response.json()
-            logger.info(f"Successfully fetched JWKS with {len(jwks_data.get('keys', []))} keys")
-            return jwks_data
-    except httpx.TimeoutException as e:
-        logger.error(f"Timeout while fetching JWKS from {jwks_url}: {e}")
-        raise Exception("Unable to retrieve authentication keys")
-    except httpx.HTTPStatusError as e:
-        logger.error(f"HTTP error {e.response.status_code} while fetching JWKS from {jwks_url}: {e.response.text}")
-        raise Exception("Unable to retrieve authentication keys")
-    except Exception as e:
-        logger.error(f"Failed to fetch JWKS from {jwks_url}: {e}")
-        raise Exception("Unable to retrieve authentication keys")
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-
-class IDTokenValidationError(Exception):
-    """Custom exception for ID token validation errors."""
-
-    def __init__(self, message: str, error_type: str = "validation_error"):
-        self.message = message
-        self.error_type = error_type
-        super().__init__(self.message)
-
-
-class AccessTokenError(Exception):
-    """Custom exception for application JWT access token errors."""
-
-    def __init__(self, message: str):
-        self.message = message
-        super().__init__(self.message)
-
-
-def create_access_token(claims: Dict[str, Any], expires_minutes: Optional[int] = None) -> str:
-    """Create signed JWT access token from provided claims."""
-    if not settings.jwt_secret_key:
-        logger.error("JWT secret key is not configured")
-        raise ValueError("JWT secret key is not configured")
-
-    now = datetime.now(timezone.utc)
-    token_claims = claims.copy()
-
-    expiry_minutes = expires_minutes if expires_minutes is not None else int(settings.jwt_expire_minutes)
-    expire_at = now + timedelta(minutes=expiry_minutes)
-
-    token_claims.update(
-        {
-            "exp": expire_at,
-            "iat": now,
-            "nbf": now,
-        }
+def _set_token_cookie(response: Response, token: str) -> None:
+    """Set the JWT as an HttpOnly cookie."""
+    response.set_cookie(
+        key="access_token",
+        value=token,
+        httponly=True,
+        secure=False,           # set True in production (HTTPS)
+        samesite="lax",
+        max_age=int(getattr(settings, "jwt_expire_minutes", 1440)) * 60,
+        path="/",
     )
 
-    token = jwt.encode(token_claims, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
-    user_id = token_claims.get("sub", "unknown")
-    user_hash = hashlib.sha256(str(user_id).encode()).hexdigest()[:8] if user_id != "unknown" else "unknown"
-    logger.debug("Authentication token created for user hash: %s", user_hash)
-    return token
+
+def _clear_token_cookie(response: Response) -> None:
+    response.delete_cookie(key="access_token", path="/")
 
 
-def decode_access_token(token: str) -> Dict[str, Any]:
-    """Decode and validate JWT access token."""
-    if not settings.jwt_secret_key:
-        logger.error("JWT secret key is not configured")
-        raise AccessTokenError("Authentication service is misconfigured")
+# ---------------------------------------------------------------------------
+# Google OIDC – initiate login
+# ---------------------------------------------------------------------------
+
+@router.get("/login", summary="Redirect to Google OAuth consent screen")
+async def login(request: Request, db: AsyncSession = Depends(get_db)):
+    """
+    Starts the Google OIDC flow with PKCE.
+    Stores state/nonce/code_verifier in the DB and redirects the browser to Google.
+    """
+    state = generate_state()
+    nonce = generate_nonce()
+    code_verifier = generate_code_verifier()
+    code_challenge = generate_code_challenge(code_verifier)
+
+    auth_service = AuthService(db)
+    await auth_service.store_oidc_state(state, nonce, code_verifier)
+
+    redirect_uri = f"{settings.backend_url}/api/v1/auth/callback"
+    auth_url = build_authorization_url(
+        state=state,
+        nonce=nonce,
+        code_challenge=code_challenge,
+        redirect_uri=redirect_uri,
+    )
+
+    logger.info("Redirecting user to Google OAuth consent screen")
+    return RedirectResponse(url=auth_url, status_code=status.HTTP_302_FOUND)
+
+
+# ---------------------------------------------------------------------------
+# Google OIDC – callback
+# ---------------------------------------------------------------------------
+
+@router.get("/callback", summary="Handle Google OAuth callback")
+async def callback(
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+    error_description: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Handles the redirect back from Google after the user authenticates.
+    Exchanges the authorization code for tokens, validates the ID token,
+    upserts the user in the DB, and issues an application JWT cookie.
+    """
+    frontend_url = getattr(settings, "frontend_url", "http://localhost:3000")
+
+    # ---- Handle provider errors ------------------------------------------
+    if error:
+        logger.warning("OAuth provider returned error: %s – %s", error, error_description)
+        return RedirectResponse(
+            url=f"{frontend_url}/login?error={error}",
+            status_code=status.HTTP_302_FOUND,
+        )
+
+    if not code or not state:
+        logger.warning("Callback missing code or state parameters")
+        return RedirectResponse(
+            url=f"{frontend_url}/login?error=missing_params",
+            status_code=status.HTTP_302_FOUND,
+        )
+
+    # ---- Validate state ---------------------------------------------------
+    auth_service = AuthService(db)
+    state_data = await auth_service.get_and_delete_oidc_state(state)
+
+    if not state_data:
+        logger.warning("OIDC state validation failed – unknown or expired state: %s", state)
+        return RedirectResponse(
+            url=f"{frontend_url}/login?error=invalid_state",
+            status_code=status.HTTP_302_FOUND,
+        )
+
+    nonce = state_data["nonce"]
+    code_verifier = state_data["code_verifier"]
+
+    # ---- Exchange code for tokens ----------------------------------------
+    try:
+        token_endpoint = "https://oauth2.googleapis.com/token"
+        redirect_uri = f"{settings.backend_url}/api/v1/auth/callback"
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            token_response = await client.post(
+                token_endpoint,
+                data={
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": redirect_uri,
+                    "client_id": settings.oidc_client_id,
+                    "client_secret": settings.oidc_client_secret,
+                    "code_verifier": code_verifier,
+                },
+            )
+            token_response.raise_for_status()
+            token_data = token_response.json()
+
+    except httpx.HTTPStatusError as exc:
+        logger.error("Token exchange HTTP error %s: %s", exc.response.status_code, exc.response.text)
+        return RedirectResponse(
+            url=f"{frontend_url}/login?error=token_exchange_failed",
+            status_code=status.HTTP_302_FOUND,
+        )
+    except Exception as exc:
+        logger.error("Token exchange failed: %s", exc)
+        return RedirectResponse(
+            url=f"{frontend_url}/login?error=token_exchange_failed",
+            status_code=status.HTTP_302_FOUND,
+        )
+
+    id_token = token_data.get("id_token")
+    if not id_token:
+        logger.error("No id_token in token response")
+        return RedirectResponse(
+            url=f"{frontend_url}/login?error=no_id_token",
+            status_code=status.HTTP_302_FOUND,
+        )
+
+    # ---- Validate ID token -----------------------------------------------
+    try:
+        claims = await validate_id_token(id_token)
+    except IDTokenValidationError as exc:
+        logger.error("ID token validation failed: %s (%s)", exc.message, exc.error_type)
+        return RedirectResponse(
+            url=f"{frontend_url}/login?error=token_validation_failed",
+            status_code=status.HTTP_302_FOUND,
+        )
+
+    # ---- Upsert user & issue app token ------------------------------------
+    platform_sub = claims.get("sub")
+    email = claims.get("email", "")
+    name = claims.get("name")
+
+    user = await auth_service.get_or_create_user(platform_sub, email, name)
+    app_token, expires_at, _ = await auth_service.issue_app_token(user)
+
+    logger.info("User %s authenticated via Google OIDC", platform_sub[:8] if platform_sub else "?")
+
+    # ---- Return token cookie and redirect to frontend ---------------------
+    redirect_response = RedirectResponse(
+        url=f"{frontend_url}/dashboard",
+        status_code=status.HTTP_302_FOUND,
+    )
+    _set_token_cookie(redirect_response, app_token)
+    return redirect_response
+
+
+# ---------------------------------------------------------------------------
+# Email / password login
+# ---------------------------------------------------------------------------
+
+@router.post("/login", summary="Login with email and password", response_model=TokenResponse)
+async def login_with_password(
+    body: LoginRequest,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Authenticates a user with email + password (bcrypt hash).
+    Returns a JWT both in the response body and as an HttpOnly cookie.
+
+    Note: passwords are stored as bcrypt hashes in the `users.password_hash` column.
+    If the user was created via Google OIDC they won't have a password – use /login (GET).
+    """
+    from models.auth import User
+    from sqlalchemy import select
 
     try:
-        payload = jwt.decode(token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm])
-        user_id = payload.get("sub", "unknown")
-        user_hash = hashlib.sha256(str(user_id).encode()).hexdigest()[:8] if user_id != "unknown" else "unknown"
-        logger.debug("Authentication token validated for user hash: %s", user_hash)
-        return payload
-    except ExpiredSignatureError as exc:
-        logger.info("Authentication token has expired")
-        raise AccessTokenError("Token has expired") from exc
-    except JWTError as exc:
-        logger.warning("Token validation failed: %s", type(exc).__name__)
-        raise AccessTokenError("Invalid authentication token") from exc
+        import bcrypt
+    except ImportError:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="Password authentication requires the 'bcrypt' package. Install it with: pip install bcrypt",
+        )
+
+    result = await db.execute(select(User).where(User.email == body.email))
+    user = result.scalar_one_or_none()
+
+    # Generic error to avoid user enumeration
+    invalid_credentials_exc = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid email or password",
+    )
+
+    if not user:
+        logger.warning("Login attempt for unknown email (hash: %s)", hash(body.email))
+        raise invalid_credentials_exc
+
+    password_hash = getattr(user, "password_hash", None)
+    if not password_hash:
+        # User exists but only has OIDC login – no local password set
+        logger.warning("Email/password login attempt for OIDC-only account: %s", user.id[:8])
+        raise invalid_credentials_exc
+
+    if not bcrypt.checkpw(body.password.encode(), password_hash.encode()):
+        logger.warning("Bad password for user %s", user.id[:8])
+        raise invalid_credentials_exc
+
+    auth_service = AuthService(db)
+    app_token, expires_at, _ = await auth_service.issue_app_token(user)
+
+    _set_token_cookie(response, app_token)
+
+    return TokenResponse(
+        access_token=app_token,
+        token_type="bearer",
+        expires_at=expires_at.isoformat(),
+    )
 
 
-async def validate_id_token(id_token: str) -> Optional[Dict[str, Any]]:
-    """Validate ID token with proper JWT signature verification using JWKS."""
-    try:
-        header = jwt.get_unverified_header(id_token)
-        kid = header.get("kid")
+# ---------------------------------------------------------------------------
+# Current user
+# ---------------------------------------------------------------------------
 
-        if not kid:
-            logger.error("ID token validation failed: No key ID found in JWT header")
-            raise IDTokenValidationError("Token format is invalid", "missing_kid")
-
-        try:
-            jwks = await get_jwks()
-        except Exception as e:
-            logger.error(
-                f"ID token validation failed: Failed to fetch JWKS from issuer {settings.oidc_issuer_url}: {e}"
-            )
-            raise IDTokenValidationError("Unable to retrieve authentication keys", "jwks_fetch_error")
-
-        key = None
-        for jwk in jwks.get("keys", []):
-            if jwk.get("kid") == kid:
-                key = jwk
-                break
-
-        if not key:
-            logger.error(
-                f"ID token validation failed: No key found for kid: {kid} in JWKS from {settings.oidc_issuer_url}"
-            )
-            raise IDTokenValidationError("Authentication key validation failed", "key_not_found")
-
-        import base64
-
-        from cryptography.hazmat.primitives import serialization
-        from cryptography.hazmat.primitives.asymmetric import rsa
-
-        def base64url_decode(inp):
-            """Decode base64url-encoded string."""
-            padding = 4 - (len(inp) % 4)
-            if padding != 4:
-                inp += "=" * padding
-            return base64.urlsafe_b64decode(inp)
-
-        try:
-            n = int.from_bytes(base64url_decode(key["n"]), "big")
-            e = int.from_bytes(base64url_decode(key["e"]), "big")
-            public_numbers = rsa.RSAPublicNumbers(e, n)
-            public_key = public_numbers.public_key()
-            pem_key = public_key.public_bytes(
-                encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo
-            )
-        except Exception as e:
-            logger.error(f"ID token validation failed: Failed to convert JWK to PEM format: {e}")
-            raise IDTokenValidationError("Authentication key processing failed", "key_conversion_error")
-
-        try:
-            payload = jwt.decode(
-                id_token,
-                pem_key,
-                algorithms=["RS256"],
-                issuer=settings.oidc_issuer_url,
-                audience=settings.oidc_client_id,
-                options={"verify_at_hash": False},  # FIX: access_token not available to verify at_hash
-            )
-            user_id = payload.get("sub", "unknown")
-            user_hash = hashlib.sha256(str(user_id).encode()).hexdigest()[:8] if user_id != "unknown" else "unknown"
-            logger.info("ID token successfully validated for user hash: %s", user_hash)
-            return payload
-        except ExpiredSignatureError:
-            logger.error("JWT validation failed: ID token has expired")
-            raise IDTokenValidationError("Token has expired", "token_expired")
-        except JWSSignatureError:
-            logger.error("JWT validation failed: Invalid JWT signature")
-            raise IDTokenValidationError("Token signature verification failed", "invalid_signature")
-        except JWTClaimsError as e:
-            logger.error(f"JWT validation failed: Claims validation error: {e}")
-            if "iss" in str(e).lower() or "issuer" in str(e).lower():
-                raise IDTokenValidationError("Token issuer validation failed", "invalid_issuer")
-            elif "aud" in str(e).lower() or "audience" in str(e).lower():
-                raise IDTokenValidationError("Token audience validation failed", "invalid_audience")
-            else:
-                raise IDTokenValidationError("Token claims validation failed", "invalid_claims")
-
-    except IDTokenValidationError:
-        raise
-    except JWTError as e:
-        logger.error(f"JWT validation failed: {e}")
-        raise IDTokenValidationError("Token validation failed", "jwt_error")
-    except Exception as e:
-        logger.error(f"Unexpected error during ID token validation: {e}")
-        raise IDTokenValidationError("Authentication processing failed", "unexpected_error")
-
-
-def build_authorization_url(
-    state: str,
-    nonce: str,
-    code_challenge: Optional[str] = None,
-    redirect_uri: Optional[str] = None,
-) -> str:
-    """Build OIDC authorization URL with optional PKCE support."""
-    import urllib.parse
-
-    params = {
-        "client_id": settings.oidc_client_id,
-        "response_type": "code",
-        "scope": settings.oidc_scope,
-        "redirect_uri": redirect_uri or f"{settings.backend_url}/api/v1/auth/callback",
-        "state": state,
-        "nonce": nonce,
+@router.get("/me", summary="Get currently authenticated user")
+async def get_me(current_user=Depends(get_current_user)):
+    """Returns the JWT claims of the currently authenticated user."""
+    return {
+        "id": current_user.get("sub"),
+        "email": current_user.get("email"),
+        "name": current_user.get("name"),
+        "role": current_user.get("role"),
+        "last_login": current_user.get("last_login"),
     }
 
-    if code_challenge:
-        params["code_challenge"] = code_challenge
-        params["code_challenge_method"] = "S256"
 
-    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
-    return auth_url
+# ---------------------------------------------------------------------------
+# Logout
+# ---------------------------------------------------------------------------
 
-
-def build_logout_url(id_token: Optional[str] = None) -> str:
-    """Build OIDC logout URL."""
-    import urllib.parse
-
-    params = {"post_logout_redirect_uri": f"{settings.frontend_url}/logout-callback"}
-
-    if id_token:
-        params["id_token_hint"] = id_token
-
-    logout_url = f"{settings.oidc_issuer_url}/logout?" + urllib.parse.urlencode(params)
-    return logout_url
+@router.post("/logout", summary="Logout – clears the session cookie")
+async def logout(response: Response):
+    """Clears the access_token cookie. Token is stateless so server-side invalidation is not required."""
+    _clear_token_cookie(response)
+    return {"detail": "Logged out successfully"}
