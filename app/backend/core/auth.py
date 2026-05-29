@@ -1,4 +1,4 @@
-import base64
+﻿import base64
 import hashlib
 import logging
 import secrets
@@ -36,7 +36,7 @@ def generate_code_challenge(code_verifier: str) -> str:
 
 async def get_jwks() -> Dict[str, Any]:
     """Get JWKS (JSON Web Key Set) from OIDC provider."""
-    jwks_url = f"{settings.oidc_issuer_url}/.well-known/jwks.json"
+    jwks_url = "https://www.googleapis.com/oauth2/v3/certs"
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             logger.info(f"Fetching JWKS from: {jwks_url}")
@@ -194,6 +194,7 @@ async def validate_id_token(id_token: str) -> Optional[Dict[str, Any]]:
                 algorithms=["RS256"],
                 issuer=settings.oidc_issuer_url,
                 audience=settings.oidc_client_id,
+                options={"verify_at_hash": False},
             )
             # Log user hash instead of actual user ID to avoid exposing sensitive information
             user_id = payload.get("sub", "unknown")
@@ -250,7 +251,7 @@ def build_authorization_url(
         params["code_challenge"] = code_challenge
         params["code_challenge_method"] = "S256"
 
-    auth_url = f"{settings.oidc_issuer_url}/authorize?" + urllib.parse.urlencode(params)
+    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
     return auth_url
 
 
